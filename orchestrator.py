@@ -1,0 +1,131 @@
+import asyncio
+import uuid
+from typing import Any, AsyncIterator, List, Optional, Tuple
+
+from langchain_core.callbacks import AsyncCallbackHandler
+
+from agent_graph import build_graph_agent
+from agent_rewrite import rewrite_query
+from config import get_langsmith_tags, settings
+from intent_gate import get_canned_answer
+from utils import last_ai_content
+
+
+class _AgentRunIdCallback(AsyncCallbackHandler):
+    """Capture LangSmith run_id of the root agent_graph run."""
+
+    def __init__(self, run_ids: List[str]):
+        self.run_ids = run_ids
+
+    async def on_chain_start(self, serialized, inputs, *, run_id, parent_run_id=None, **kwargs):
+        if parent_run_id is None:
+            self.run_ids.append(str(run_id))
+
+
+async def run_graph(
+    messages: list,
+    servers: dict,
+    tools_timeout_s: float,
+    invoke_timeout_s: float,
+    *,
+    request_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Tuple[List[Any], Optional[str]]:
+    """Run one phase (RAG) and return (messages, agent_graph_run_id). agent_graph_run_id from LangSmith."""
+    if not servers:
+        return messages, None
+    agent = await build_graph_agent(servers, tools_timeout_s)
+    run_ids: List[str] = []
+    callback = _AgentRunIdCallback(run_ids)
+    configurable = {k: v for k, v in (("request_id", request_id), ("session_id", session_id)) if v is not None}
+    config = {
+        "run_name": "agent_graph",
+        "callbacks": [callback],
+        "tags": get_langsmith_tags(request_id=request_id, session_id=session_id),
+        "configurable": configurable,
+    }
+    out = await asyncio.wait_for(
+        agent.ainvoke({"messages": messages}, config=config),
+        timeout=invoke_timeout_s,
+    )
+    agent_graph_run_id = run_ids[0] if run_ids else None
+    return out["messages"], agent_graph_run_id
+
+
+async def answer_query_sync(
+    query: str,
+    *,
+    tools_timeout_s: Optional[float] = None,
+    invoke_timeout_s: Optional[float] = None,
+    request_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Run agent and return the final answer. Consumes stream_answer_query for single code path."""
+    answer = ""
+    async for event in stream_answer_query(
+        query,
+        request_id=request_id,
+        session_id=session_id,
+        tools_timeout_s=tools_timeout_s,
+        invoke_timeout_s=invoke_timeout_s,
+    ):
+        if event.get("type") == "answer":
+            answer = event.get("text", "")
+        elif event.get("type") == "error":
+            return event.get("text", "Unknown error")
+    return answer
+
+
+async def stream_answer_query(
+    query: str,
+    *,
+    session_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+    tools_timeout_s: Optional[float] = None,
+    invoke_timeout_s: Optional[float] = None,
+) -> AsyncIterator[dict]:
+    """Stream the assistant reply. IntentGate (smalltalk) → canned answer; else EntityRewrite → Router → Graph (RAG)."""
+    request_id = request_id or str(uuid.uuid4())
+    tools_s = tools_timeout_s if tools_timeout_s is not None else settings.tools_timeout_s
+    invoke_s = invoke_timeout_s if invoke_timeout_s is not None else settings.invoke_timeout_s
+    try:
+        rag_servers = settings.rag_server_config
+        yield {"type": "request_id", "session_id": session_id, "request_id": request_id}
+        # IntentGate (smalltalk?) — agent
+        canned = await get_canned_answer(
+            query, request_id=request_id, session_id=session_id
+        )
+        if canned is not None:
+            yield {"type": "answer", "text": canned}
+            yield {"type": "state", "phase": "done", "message": "Complete"}
+            return
+        # no → EntityRewrite (Taixing?) → Router → Graph
+        yield {"type": "state", "phase": "rewrite", "message": "Rewriting question..."}
+        rewritten = await rewrite_query(query, request_id=request_id, session_id=session_id)
+        yield {"type": "rewrite", "text": rewritten}
+        yield {"type": "route", "route": "RAG"}
+        messages = [{"role": "user", "content": rewritten}]
+        agent_graph_run_id = None
+        if rag_servers:
+            yield {"type": "state", "phase": "rag", "message": "Running RAG phase..."}
+            messages, agent_graph_run_id = await run_graph(
+                messages, rag_servers, tools_s, invoke_s,
+                request_id=request_id, session_id=session_id,
+            )
+        content = last_ai_content(messages)
+        if content:
+            event = {"type": "answer", "text": content}
+            if agent_graph_run_id:
+                event["agent_graph_run_id"] = agent_graph_run_id
+            yield event
+        yield {"type": "state", "phase": "done", "message": "Complete"}
+    except Exception as e:
+        yield {"type": "error", "text": format_error(e)}
+
+
+def format_error(e: Exception) -> str:
+    """Unwrap ExceptionGroup so the real cause is shown."""
+    sub = getattr(e, "exceptions", None)
+    if sub:
+        return f"Error: {type(sub[0]).__name__}: {sub[0]}"
+    return f"Error: {type(e).__name__}: {e}"
