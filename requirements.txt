@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+
+python-dotenv
+
+mcp
+
+langchain-community
+langchain-openai
+langsmith
+langchain-mcp-adapters
+langgraph
+
+httpx
+pytest
+pytest-asyncio
